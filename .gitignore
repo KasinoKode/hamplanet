@@ -1,0 +1,11 @@
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+.ruff_cache/
+.ty_cache/
+.env
+storage_state.json
+hamplanet.db
+.DS_Store
+.claude/

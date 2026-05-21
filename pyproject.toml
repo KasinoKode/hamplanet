@@ -1,0 +1,32 @@
+[project]
+name = "hamplanet"
+version = "0.1.0"
+description = "Playwright-driven Rumble downvote automation"
+requires-python = ">=3.14"
+dependencies = [
+    "playwright>=1.49",
+    "python-dotenv>=1.0",
+]
+
+[project.scripts]
+hamplanet = "hamplanet.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/hamplanet"]
+
+[dependency-groups]
+dev = [
+    "ruff>=0.8",
+    "ty>=0.0.1a1",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py314"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]
