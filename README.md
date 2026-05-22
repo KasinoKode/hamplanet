@@ -7,14 +7,30 @@ Playwright-driven Rumble downvote automation, aimed squarely at the ham planet (
 ## Features
 
 - **Multi-channel** — drive any list of Rumble channels from `channels.json`.
+- **Videos + shorts** — each channel run does a videos pass and a shorts pass by default (`--mode` narrows it).
 - **Stateful** — SQLite log of every URL acted on (`hamplanet.db`); future runs skip them automatically.
 - **Auth-aware** — caches a Playwright `storage_state.json` so you log in once.
-- **Polite-ish pacing** — randomized 3-6s sleep between videos (tunable).
+- **Polite-ish pacing** — randomized 4-6s sleep between items (tunable; bumped from 3s after hitting Rumble's vote rate limit).
 - **Dry-run by default** — see the targets before anything clicks.
-- **Per-channel limit** — `--limit N` applies per channel, ideal for smoke tests across the whole roster.
+- **Per-channel limit** — `--limit N` applies per pass per channel, ideal for smoke tests across the whole roster.
 - **Resumable** — Ctrl-C, come back later; the DB picks up where you left off.
 
 ## Setup
+
+Install [uv](https://docs.astral.sh/uv/) (the only prerequisite — it handles Python and the venv):
+
+```sh
+# macOS / Linux
+curl -LsSf https://astral.sh/uv/install.sh | sh
+
+# or via Homebrew
+brew install uv
+
+# Windows (PowerShell)
+powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"
+```
+
+Then bootstrap the project:
 
 ```sh
 uv sync
@@ -42,15 +58,22 @@ Requires Python 3.14+. uv will install it in a venv if you don't have it globall
 
 ```sh
 # Dry-run across every channel — no clicks, just shows what would happen.
+# Default mode is "both": videos pass then shorts pass per channel.
 uv run hamplanet
 
-# Smoke test: 2 videos per channel, real clicks.
+# Smoke test: 2 videos + 2 shorts per channel, real clicks.
 uv run hamplanet --execute --limit 2
 
-# Full sweep, real clicks.
+# Full sweep, real clicks (videos + shorts).
 uv run hamplanet --execute
 
-# Scrape-only — list every discovered URL, no per-video visits.
+# Videos only (old default behavior).
+uv run hamplanet --mode videos --execute
+
+# Shorts only — handy for backfilling shorts after a videos-only run.
+uv run hamplanet --mode shorts --execute
+
+# Scrape-only — list every discovered URL, no per-item visits.
 uv run hamplanet --no-auth --limit 0
 
 # Watch it work.
@@ -62,10 +85,11 @@ uv run hamplanet --execute --headed
 | Flag | Default | What it does |
 |---|---|---|
 | `--config PATH` | `channels.json` | Channel list JSON |
+| `--mode {videos,shorts,both}` | `both` | Which content type(s) to process per channel |
 | `--execute` | off | Actually click (without it, run is a dry-run) |
-| `--limit N` | none | Process at most N videos **per channel**; `0` = scrape-only |
+| `--limit N` | none | Process at most N items **per pass per channel**; `0` = scrape-only |
 | `--headed` | off | Show the browser window |
-| `--min-delay` / `--max-delay` | 3.0 / 6.0 | Random sleep range between videos (seconds) |
+| `--min-delay` / `--max-delay` | 4.0 / 6.0 | Random sleep range between items (seconds) |
 | `--login` | off | Force a fresh login even if `storage_state.json` exists |
 | `--storage PATH` | `storage_state.json` | Playwright session file |
 | `--no-auth` | off | Skip login (dry-runs against the public site) |
@@ -84,7 +108,7 @@ uv run hamplanet --execute --headed
 
 ### Inspecting state
 
-The DB is plain SQLite — one row per acted-on URL.
+The DB is plain SQLite — one row per acted-on URL. Videos and shorts share the same `actions` table; the URL itself tells them apart (shorts contain `/shorts/`).
 
 ```sh
 # Total acted-on
@@ -95,6 +119,11 @@ sqlite3 hamplanet.db "SELECT channel, COUNT(*) FROM actions GROUP BY channel;"
 
 # Breakdown by result
 sqlite3 hamplanet.db "SELECT result, COUNT(*) FROM actions GROUP BY result;"
+
+# Videos vs shorts
+sqlite3 hamplanet.db \
+  "SELECT CASE WHEN url LIKE '%/shorts/%' THEN 'short' ELSE 'video' END AS kind,
+          COUNT(*) FROM actions GROUP BY kind;"
 
 # Most recent 10
 sqlite3 hamplanet.db \
@@ -114,4 +143,4 @@ rm hamplanet.db
 actions(url PK, site, channel, action, result, created_at)
 ```
 
-`url` is the primary key, so re-runs are idempotent. `site` + `channel` are columns (not part of the PK) to leave room for adding YouTube or other sites alongside Rumble.
+`url` is the primary key, so re-runs are idempotent. Shorts (`/shorts/v...`) and regular videos (`/v...-title.html`) live in distinct URL namespaces and never collide. `site` + `channel` are columns (not part of the PK) to leave room for adding YouTube or other sites alongside Rumble.

@@ -9,16 +9,17 @@ import os
 import random
 import sys
 from collections import Counter
+from collections.abc import Awaitable, Callable
 from pathlib import Path
 from urllib.parse import urlparse
 
 from dotenv import load_dotenv
-from playwright.async_api import async_playwright
+from playwright.async_api import Page, async_playwright
 
 from hamplanet.auth import get_authed_context
-from hamplanet.scrape import collect_video_urls
+from hamplanet.scrape import collect_short_urls, collect_video_urls
 from hamplanet.store import ActionStore
-from hamplanet.vote import VoteResult, downvote
+from hamplanet.vote import VoteResult, downvote, downvote_short
 
 DEFAULT_STORAGE_PATH = Path("storage_state.json")
 DEFAULT_DB_PATH = Path("hamplanet.db")
@@ -50,13 +51,22 @@ def _load_channels(config_path: Path) -> list[str]:
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         prog="hamplanet",
-        description="Downvote every video on a Rumble channel.",
+        description="Downvote every video and short on a Rumble channel.",
     )
     parser.add_argument(
         "--config",
         type=Path,
         default=DEFAULT_CONFIG_PATH,
         help="Path to channels config JSON (default: ./channels.json).",
+    )
+    parser.add_argument(
+        "--mode",
+        choices=("videos", "shorts", "both"),
+        default="both",
+        help=(
+            "Which content type(s) to process per channel "
+            "(default: both — videos pass then shorts pass)."
+        ),
     )
     parser.add_argument(
         "--execute",
@@ -67,20 +77,23 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--limit",
         type=int,
         default=None,
-        help="Process at most N videos (0 means scrape-only, no per-video visits).",
+        help=(
+            "Process at most N items per pass per channel "
+            "(0 means scrape-only, no per-item visits)."
+        ),
     )
     parser.add_argument("--headed", action="store_true", help="Show the browser window")
     parser.add_argument(
         "--min-delay",
         type=float,
-        default=3.0,
-        help="Lower bound of randomized between-video delay in seconds (default: 3.0).",
+        default=4.0,
+        help="Lower bound of randomized between-item delay in seconds (default: 4.0).",
     )
     parser.add_argument(
         "--max-delay",
         type=float,
         default=6.0,
-        help="Upper bound of randomized between-video delay in seconds (default: 6.0).",
+        help="Upper bound of randomized between-item delay in seconds (default: 6.0).",
     )
     parser.add_argument(
         "--login",
@@ -112,11 +125,89 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
+async def _run_pass(
+    *,
+    label: str,
+    urls: list[str],
+    page: Page,
+    store: ActionStore,
+    site: str,
+    channel: str | None,
+    downvoter: Callable[..., Awaitable[VoteResult]],
+    args: argparse.Namespace,
+    tally: Counter[VoteResult],
+) -> None:
+    print(f"  {label}: Discovered {len(urls)}")
+
+    if args.limit == 0:
+        for url in urls:
+            print(url)
+        return
+
+    acted = set() if args.ignore_state else store.acted_urls()
+    if acted:
+        before = len(urls)
+        urls = [u for u in urls if u not in acted]
+        print(f"  {label}: Skipping {before - len(urls)} already-acted ({len(urls)} remaining)")
+
+    targets = urls if args.limit is None else urls[: args.limit]
+    mode_label = "EXECUTE" if args.execute else "DRY-RUN"
+    print(f"  {label}: Mode: {mode_label}  Targets: {len(targets)}")
+
+    for i, url in enumerate(targets, 1):
+        try:
+            result = await downvoter(page, url, execute=args.execute)
+            if result == VoteResult.NOT_FOUND:
+                # The vote button occasionally fails to render on the first load.
+                # A short pause + re-navigation (the downvoter re-goes-to the URL)
+                # usually clears it.
+                backoff = 3.0
+                print(
+                    f"  [{i:>3}/{len(targets)}] NOT_FOUND (button may not have rendered); "
+                    f"backing off {backoff:.1f}s and retrying"
+                )
+                await asyncio.sleep(backoff)
+                result = await downvoter(page, url, execute=args.execute)
+            if result == VoteResult.AUTH_REQUIRED:
+                # Often this is actually Rumble's vote rate limit masquerading
+                # as the login modal — back off and try once more before
+                # accepting the result.
+                backoff = max(args.max_delay * 4, 15.0)
+                print(
+                    f"  [{i:>3}/{len(targets)}] AUTH_REQUIRED (possible rate limit); "
+                    f"backing off {backoff:.1f}s and retrying"
+                )
+                await asyncio.sleep(backoff)
+                result = await downvoter(page, url, execute=args.execute)
+        except Exception as exc:
+            print(f"  [{i:>3}/{len(targets)}] ERROR  {url} :: {exc!r}")
+            tally[VoteResult.NOT_FOUND] += 1
+            continue
+
+        tally[result] += 1
+        print(f"  [{i:>3}/{len(targets)}] {result.value:<14} {url}")
+
+        if result in (VoteResult.CLICKED, VoteResult.ALREADY_DOWN):
+            store.record(
+                url=url,
+                site=site,
+                channel=channel,
+                action="downvote",
+                result=result.value,
+            )
+
+        if i < len(targets) and args.max_delay > 0:
+            pause = random.uniform(args.min_delay, args.max_delay)
+            print(f"          sleeping {pause:.2f}s")
+            await asyncio.sleep(pause)
+
+
 async def run(args: argparse.Namespace) -> int:
     load_dotenv()
 
     channels = _load_channels(args.config)
     print(f"Loaded {len(channels)} channel(s) from {args.config}")
+    print(f"Mode: {args.mode}")
 
     async with async_playwright() as pw:
         browser = await pw.chromium.launch(headless=not args.headed)
@@ -153,51 +244,34 @@ async def run(args: argparse.Namespace) -> int:
             for ch_idx, channel_url in enumerate(channels, 1):
                 site, channel = _site_channel(channel_url)
                 print(f"\n[Channel {ch_idx}/{len(channels)}] {channel_url}")
-                urls = await collect_video_urls(page, channel_url)
-                print(f"  Discovered {len(urls)} videos")
 
-                if args.limit == 0:
-                    for url in urls:
-                        print(url)
-                    continue
-
-                acted = set() if args.ignore_state else store.acted_urls()
-                if acted:
-                    before = len(urls)
-                    urls = [u for u in urls if u not in acted]
-                    print(
-                        f"  Skipping {before - len(urls)} already-acted "
-                        f"({len(urls)} remaining)"
+                if args.mode in ("videos", "both"):
+                    video_urls = await collect_video_urls(page, channel_url)
+                    await _run_pass(
+                        label="Videos",
+                        urls=video_urls,
+                        page=page,
+                        store=store,
+                        site=site,
+                        channel=channel,
+                        downvoter=downvote,
+                        args=args,
+                        tally=tally,
                     )
 
-                targets = urls if args.limit is None else urls[: args.limit]
-                mode = "EXECUTE" if args.execute else "DRY-RUN"
-                print(f"  Mode: {mode}  Targets: {len(targets)}")
-
-                for i, url in enumerate(targets, 1):
-                    try:
-                        result = await downvote(page, url, execute=args.execute)
-                    except Exception as exc:
-                        print(f"  [{i:>3}/{len(targets)}] ERROR  {url} :: {exc!r}")
-                        tally[VoteResult.NOT_FOUND] += 1
-                        continue
-
-                    tally[result] += 1
-                    print(f"  [{i:>3}/{len(targets)}] {result.value:<14} {url}")
-
-                    if result in (VoteResult.CLICKED, VoteResult.ALREADY_DOWN):
-                        store.record(
-                            url=url,
-                            site=site,
-                            channel=channel,
-                            action="downvote",
-                            result=result.value,
-                        )
-
-                    if i < len(targets) and args.max_delay > 0:
-                        pause = random.uniform(args.min_delay, args.max_delay)
-                        print(f"          sleeping {pause:.2f}s")
-                        await asyncio.sleep(pause)
+                if args.mode in ("shorts", "both"):
+                    short_urls = await collect_short_urls(page, channel_url)
+                    await _run_pass(
+                        label="Shorts",
+                        urls=short_urls,
+                        page=page,
+                        store=store,
+                        site=site,
+                        channel=channel,
+                        downvoter=downvote_short,
+                        args=args,
+                        tally=tally,
+                    )
         finally:
             store.close()
 

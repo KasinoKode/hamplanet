@@ -1,0 +1,2 @@
+- use astral python tooling, uv, ruff, ty
+- run ci.sh after any file edits
